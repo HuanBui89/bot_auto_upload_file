@@ -6,7 +6,9 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from google.oauth2 import service_account
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+import pickle
 
 # ============================================================
 # LOGGING
@@ -18,26 +20,49 @@ logger = logging.getLogger(__name__)
 # CONFIG
 # ============================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
-GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
+FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", None)  # Nếu có folder gốc cố định thì thêm ở đây
 
-if not BOT_TOKEN or not FOLDER_ID or not GOOGLE_CREDENTIALS:
-    raise ValueError("⚠️ Thiếu biến môi trường BOT_TOKEN hoặc DRIVE_FOLDER_ID hoặc GOOGLE_CREDENTIALS")
+if not BOT_TOKEN:
+    raise ValueError("⚠️ Thiếu biến môi trường BOT_TOKEN")
 
-creds_info = json.loads(GOOGLE_CREDENTIALS)
-SCOPES = ["https://www.googleapis.com/auth/drive"]
-creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
-drive_service = build("drive", "v3", credentials=creds)
+SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
+# ============================================================
+# GOOGLE DRIVE AUTH (OAuth)
+# ============================================================
+def create_drive_service():
+    creds = None
+    # Lưu token sau lần đầu login
+    if os.path.exists("token.pickle"):
+        with open("token.pickle", "rb") as token:
+            creds = pickle.load(token)
+
+    # Nếu chưa có token hoặc token hết hạn
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file("client_secret.json", SCOPES)
+            creds = flow.run_local_server(port=0)
+        # Lưu lại để lần sau không cần login
+        with open("token.pickle", "wb") as token:
+            pickle.dump(creds, token)
+
+    service = build("drive", "v3", credentials=creds)
+    return service
+
+
+drive_service = create_drive_service()
 
 # ============================================================
 # GOOGLE DRIVE FUNCTIONS
 # ============================================================
 def get_or_create_folder(order_code: str):
     """Tạo folder nếu chưa có."""
+    parent_query = f"'{FOLDER_ID}' in parents and " if FOLDER_ID else ""
     query = (
         f"name='{order_code}' and mimeType='application/vnd.google-apps.folder' "
-        f"and '{FOLDER_ID}' in parents and trashed=false"
+        f"and {parent_query} trashed=false"
     )
     results = drive_service.files().list(q=query, fields="files(id, name)").execute()
     items = results.get("files", [])
@@ -49,8 +74,10 @@ def get_or_create_folder(order_code: str):
     folder_metadata = {
         "name": order_code,
         "mimeType": "application/vnd.google-apps.folder",
-        "parents": [FOLDER_ID],
     }
+    if FOLDER_ID:
+        folder_metadata["parents"] = [FOLDER_ID]
+
     folder = drive_service.files().create(body=folder_metadata, fields="id").execute()
     logger.info(f"🆕 Đã tạo folder mới: {order_code}")
     return folder["id"]
@@ -65,6 +92,13 @@ def upload_to_drive(file_path: str, file_name: str, folder_id: str):
             body=file_metadata, media_body=media, fields="id"
         ).execute()
         file_id = uploaded["id"]
+
+        # Set quyền xem
+        drive_service.permissions().create(
+            fileId=file_id,
+            body={"role": "reader", "type": "anyone"},
+        ).execute()
+
         logger.info(f"✅ Upload thành công: {file_name}")
         return f"https://drive.google.com/file/d/{file_id}/view"
     except Exception as e:
@@ -84,14 +118,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
 
-    # --- Xác định nếu là tin nhắn forward ---
-    if msg.forward_origin:
-        origin = msg.forward_origin
-        logger.info(f"📩 Tin nhắn được forward (type={origin.type})")
-    else:
-        logger.info("💬 Tin nhắn gửi trực tiếp.")
-
-    # --- Lấy mã đơn ---
     text = (msg.caption or msg.text or "").strip()
     match = re.search(r"\b([A-Z0-9]{6,})\b", text)
     if not match:
@@ -156,7 +182,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.ALL, handle_media))
-    logger.info("🚀 Bot đang chạy 24/7 trên Railway...")
+    logger.info("🚀 Bot đang chạy 24/7 trên Railway hoặc local...")
     app.run_polling()
 
 
